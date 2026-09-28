@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { detectExecveLimitViolations, formatExecveLimitError } from "./execve-limits.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -4737,6 +4738,16 @@ export async function runChildProcess(
         const childEnv = { ...mergedEnv, ...target.env };
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
+        }
+        // Name the offending entry before execve fails with an opaque
+        // `spawn E2BIG`. See ./execve-limits.ts.
+        const execveViolations = detectExecveLimitViolations(
+          target.command,
+          target.args,
+          childEnv as Record<string, string | undefined>,
+        );
+        if (execveViolations.length > 0) {
+          throw formatExecveLimitError(target.command, execveViolations);
         }
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
