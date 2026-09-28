@@ -706,21 +706,33 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const uploadPath = `${remotePath}.${randomUUID()}.paperclip-upload`;
       const tempPath = `${uploadPath}.b64`;
       const decodedPath = `${uploadPath}.decoded`;
-      await runChecked(
-        `prepare upload ${remotePath}`,
-        `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(tempPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(tempPath)}`,
-      );
-      const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
-      for (const chunk of base64Chunks(base64Body)) {
+      try {
         await runChecked(
-          `append upload chunk ${remotePath}`,
-          `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(tempPath)}`,
+          `prepare upload ${remotePath}`,
+          `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(tempPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(tempPath)}`,
         );
+        const base64Body = toBuffer(Buffer.from(body, "utf8")).toString("base64");
+        for (const chunk of base64Chunks(base64Body)) {
+          await runChecked(
+            `append upload chunk ${remotePath}`,
+            `printf '%s' ${shellQuote(chunk)} >> ${shellQuote(tempPath)}`,
+          );
+        }
+        await runChecked(
+          `finalize upload ${remotePath}`,
+          `base64 -d < ${shellQuote(tempPath)} > ${shellQuote(decodedPath)} && mv ${shellQuote(decodedPath)} ${shellQuote(remotePath)} && rm -f ${shellQuote(tempPath)}`,
+        );
+      } catch (error) {
+        // Abandon only this attempt's intermediates, never the published file
+        // or another attempt. A late finalize may fail or finish publishing;
+        // either is safe for a sequence-aware caller. Preserve the original
+        // failure even when the provider is still unavailable for cleanup.
+        await runChecked(
+          `clean failed upload ${remotePath}`,
+          `rm -f ${shellQuote(tempPath)} ${shellQuote(decodedPath)}`,
+        ).catch(() => undefined);
+        throw error;
       }
-      await runChecked(
-        `finalize upload ${remotePath}`,
-        `base64 -d < ${shellQuote(tempPath)} > ${shellQuote(decodedPath)} && mv ${shellQuote(decodedPath)} ${shellQuote(remotePath)} && rm -f ${shellQuote(tempPath)}`,
-      );
     },
     writeResponseFile: async (responsePath, body, options = {}) => {
       const responseDir = path.posix.dirname(responsePath);

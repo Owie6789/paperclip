@@ -555,13 +555,16 @@ describe("stdin file race (parent PAP-4037)", () => {
         expect(delivered).toBe(first + "-second");
         if (lateFinalize) {
           // A provider can return 502 while its original finalize still runs.
-          // It must keep its own upload bytes and remain harmless even after
-          // the retry and the next sequence have both been consumed.
-          expect((await lateFinalize()).exitCode).toBe(0);
+          // Cleanup may invalidate its private upload, but it cannot touch
+          // the retry's data or repeat input after newer messages arrived.
+          await lateFinalize();
           peer.write(JSON.stringify({ token, type: "stdin", data: Buffer.from("-third").toString("base64") }) + "\n");
           await waitFor(() => delivered.endsWith("-third"), 8_000);
           expect(delivered).toBe(first + "-second-third");
         }
+        const files = await readdir(path.join(rootDir, "runtime", "process-sessions"), { recursive: true });
+        expect(files.filter((file) => file.endsWith(".paperclip-upload.b64") || file.endsWith(".paperclip-upload.decoded")))
+          .toEqual([]);
       } finally {
         peer?.destroy();
         await bridge?.stop();
@@ -624,6 +627,32 @@ describe("stdin file race (parent PAP-4037)", () => {
   }, 15_000);
 
   // ---- Host atomic-write tests ------------------------------------------
+
+  it("preserves the upload failure when best-effort cleanup also fails", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-upload-cleanup-"));
+    cleanupDirs.push(rootDir);
+    const local = createLocalSandboxRunner();
+    const uploadFailure = new Error("Request failed with status code 502");
+    let cleanupAttempted = false;
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      remoteCwd: rootDir,
+      runner: {
+        execute: async (input) => {
+          const script = input.args?.[1] ?? "";
+          if (script.startsWith("rm -f")) {
+            cleanupAttempted = true;
+            throw new Error("Request failed with status code 403");
+          }
+          const result = await local.execute(input);
+          if (script.startsWith("printf")) throw uploadFailure;
+          return result;
+        },
+      },
+    });
+    await expect(client.writeTextFile(path.join(rootDir, "message.json"), "test input"))
+      .rejects.toBe(uploadFailure);
+    expect(cleanupAttempted).toBe(true);
+  });
 
   // A runner that executes each bridge shell script on the local filesystem,
   // so the test exercises the real command-managed `writeTextFile` script.
