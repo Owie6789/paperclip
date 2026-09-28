@@ -701,8 +701,11 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       // then moves the complete decoded content onto the final `.json` path.
       // A direct `> remotePath` redirect truncates the final path before the
       // decode writes it, so a reader can see an empty or partial file.
-      const tempPath = `${remotePath}.paperclip-upload.b64`;
-      const decodedPath = `${remotePath}.paperclip-upload.decoded`;
+      // A failed provider response does not prove the remote command stopped.
+      // Keep concurrent or retried uploads from truncating each other's bytes.
+      const uploadPath = `${remotePath}.${randomUUID()}.paperclip-upload`;
+      const tempPath = `${uploadPath}.b64`;
+      const decodedPath = `${uploadPath}.decoded`;
       await runChecked(
         `prepare upload ${remotePath}`,
         `mkdir -p ${shellQuote(remoteDir)} && rm -f ${shellQuote(tempPath)} ${shellQuote(decodedPath)} && : > ${shellQuote(tempPath)}`,

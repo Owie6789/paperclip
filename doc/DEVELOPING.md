@@ -1097,6 +1097,17 @@ agent workspace. The host `HOME` itself, a directory that contains it, a
 filesystem root, a `CODEX_HOME` overlap, or a canonical path outside the
 assigned workspace is rejected before provider startup.
 
+### Sandbox ACP input delivery
+
+The legacy sandbox process bridge retries HTTP 502, 503, and 504 failures while
+writing an input message, with at most three attempts and a short backoff.
+Retries keep the message sequence and use separate temporary upload files.
+The remote wrapper discards already-consumed sequences, so a lost provider
+response cannot send the same input bytes twice. Messages remain ordered.
+This does not restart an agent turn or replay a tool call. Authentication and
+shell errors fail immediately; exhausted input delivery closes the bridge and
+records a fixed diagnostic without logging the input payload.
+
 ### Preinstalled remote runner runtime
 
 For fast sandbox startup, bake `paperclip-runnerd` and the latest stable agent

@@ -492,6 +492,137 @@ describe("stdin file race (parent PAP-4037)", () => {
     }
   });
 
+  it.each(["prepare", "append", "finalize", "late-finalize"])(
+    "recovers a transient %s failure without repeating or reordering stdin",
+    async (stage) => {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-stdin-retry-"));
+      cleanupDirs.push(rootDir);
+      const childPath = path.join(rootDir, "echo-child.mjs");
+      await writeFile(childPath, "process.stdin.on('data', (c) => process.stdout.write(c));\n", "utf8");
+      const first = "first-" + "x".repeat(70_000);
+      let delivered = "";
+      let injected = false;
+      let lateFinalize: (() => Promise<RunProcessResult>) | undefined;
+      const local = createLocalSandboxRunner();
+      const runner = {
+        execute: async (input: Parameters<typeof local.execute>[0]) => {
+          const script = input.args?.[1] ?? "";
+          const matches = script.includes("/stdin/000000000001.json") && (
+            stage === "prepare" ? script.includes("mkdir -p") :
+            stage === "append" ? script.startsWith("printf") : script.startsWith("base64 -d")
+          );
+          if (matches && !injected) {
+            injected = true;
+            if (stage === "late-finalize") lateFinalize = () => local.execute(input);
+            else if (stage !== "prepare") await local.execute(input);
+            // The provider can lose the response after the receiver consumed
+            // the file. A retry must not repeat those bytes on the ACP stream.
+            if (stage === "finalize") await waitFor(() => delivered === first, 8_000);
+            throw new Error("Request failed with status code 502");
+          }
+          return local.execute(input);
+        },
+      };
+      const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+        runId: "run-stdin-retry",
+        target: { kind: "remote", transport: "sandbox", remoteCwd: rootDir, runner },
+        runtimeRootDir: path.join(rootDir, "runtime"),
+        adapterKey: "acpx", command: process.execPath, args: [childPath], cwd: rootDir, env: {},
+      });
+      let peer: net.Socket | undefined;
+      try {
+        const source = await readFile(bridge!.agentCommand, "utf8");
+        const port = Number(/port: (\d+)/.exec(source)![1]);
+        const token = JSON.parse(/const token = (".*?");/.exec(source)![1]) as string;
+        peer = net.createConnection({ host: "127.0.0.1", port });
+        peer.on("error", () => {});
+        peer.setEncoding("utf8");
+        let buffer = "";
+        peer.on("data", (chunk) => {
+          buffer += chunk;
+          const lines = buffer.split("\n");
+          buffer = lines.pop()!;
+          for (const line of lines) {
+            const frame = JSON.parse(line) as DeliveredFrame;
+            delivered += collectDelivered([frame]);
+          }
+        });
+        await new Promise<void>((resolve) => peer!.once("connect", resolve));
+        for (const text of [first, "-second"])
+          peer.write(JSON.stringify({ token, type: "stdin", data: Buffer.from(text).toString("base64") }) + "\n");
+        await waitFor(() => delivered.endsWith("-second"), 10_000);
+        expect(injected).toBe(true);
+        expect(delivered).toBe(first + "-second");
+        if (lateFinalize) {
+          // A provider can return 502 while its original finalize still runs.
+          // It must keep its own upload bytes and remain harmless even after
+          // the retry and the next sequence have both been consumed.
+          expect((await lateFinalize()).exitCode).toBe(0);
+          peer.write(JSON.stringify({ token, type: "stdin", data: Buffer.from("-third").toString("base64") }) + "\n");
+          await waitFor(() => delivered.endsWith("-third"), 8_000);
+          expect(delivered).toBe(first + "-second-third");
+        }
+      } finally {
+        peer?.destroy();
+        await bridge?.stop();
+      }
+    },
+    20_000,
+  );
+
+  it.each([
+    ["Request failed with status code 502", 3],
+    ["Request failed with status code 503", 3],
+    ["Request failed with status code 504", 3],
+    ["Request failed with status code 403", 1],
+    ["Remote command failed: sensitive-input", 1],
+  ] as const)("bounds input failure %s to %i attempts and stops later writes", async (failure, expectedAttempts) => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-stdin-failed-"));
+    cleanupDirs.push(rootDir);
+    let attempts = 0;
+    let laterWrite = false;
+    let stderr = "";
+    const runner = createLocalSandboxRunner(async (script) => {
+      if (!script.startsWith("mkdir -p")) return;
+      if (script.includes("/stdin/000000000002.json")) laterWrite = true;
+      if (script.includes("/stdin/000000000001.json")) {
+        attempts += 1;
+        throw new Error(failure);
+      }
+    });
+    const bridge = await startAdapterExecutionTargetProcessSessionBridge({
+      runId: "run-stdin-failed",
+      target: { kind: "remote", transport: "sandbox", remoteCwd: rootDir, runner },
+      runtimeRootDir: path.join(rootDir, "runtime"),
+      adapterKey: "acpx", command: "cat", args: [], cwd: rootDir, env: {},
+      onLog: async (stream, chunk) => { if (stream === "stderr") stderr += chunk; },
+    });
+    let peer: net.Socket | undefined;
+    try {
+      const source = await readFile(bridge!.agentCommand, "utf8");
+      const port = Number(/port: (\d+)/.exec(source)![1]);
+      const token = JSON.parse(/const token = (".*?");/.exec(source)![1]) as string;
+      peer = net.createConnection({ host: "127.0.0.1", port });
+      peer.setEncoding("utf8");
+      peer.on("error", () => {});
+      let output = "";
+      peer.on("data", (chunk) => { output += chunk; });
+      const closed = new Promise<void>((resolve) => peer!.on("close", () => resolve()));
+      await new Promise<void>((resolve) => peer!.once("connect", resolve));
+      for (const text of ["first", "second"])
+        peer.write(JSON.stringify({ token, type: "stdin", data: Buffer.from(text).toString("base64") }) + "\n");
+      await closed;
+      expect(attempts).toBe(expectedAttempts);
+      expect(laterWrite).toBe(false);
+      expect(JSON.parse(output)).toEqual({ type: "error", message: "ACP process session input delivery failed." });
+      expect(stderr).toContain("ACP process session input delivery failed.");
+      expect(stderr).not.toContain(failure);
+    } finally {
+      peer?.destroy();
+      await bridge?.stop();
+    }
+  }, 15_000);
+
   // ---- Host atomic-write tests ------------------------------------------
 
   // A runner that executes each bridge shell script on the local filesystem,
@@ -572,7 +703,7 @@ describe("stdin file race (parent PAP-4037)", () => {
     expect(finalizeScript).toBeDefined();
     expect(finalizeScript).toContain(`mv `);
     expect(finalizeScript).not.toContain(`> '${jsonPath}'`);
-    expect(finalizeScript).toContain(`> '${jsonPath}.paperclip-upload.decoded'`);
+    expect(finalizeScript).toMatch(/> '[^']+\.paperclip-upload\.decoded'/);
   });
 
   it("never exposes a partial .json file under a concurrent reader (command-managed host write)", async () => {
