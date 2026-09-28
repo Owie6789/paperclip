@@ -122,10 +122,10 @@ describe("stdin file race (parent PAP-4037)", () => {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  async function waitFor(check: () => boolean, timeoutMs = 4_000): Promise<void> {
+  async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 4_000): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (check()) return;
+      if (await check()) return;
       await delay(20);
     }
     throw new Error("Timed out waiting for condition.");
@@ -562,9 +562,10 @@ describe("stdin file race (parent PAP-4037)", () => {
           await waitFor(() => delivered.endsWith("-third"), 8_000);
           expect(delivered).toBe(first + "-second-third");
         }
-        const files = await readdir(path.join(rootDir, "runtime", "process-sessions"), { recursive: true });
-        expect(files.filter((file) => file.endsWith(".paperclip-upload.b64") || file.endsWith(".paperclip-upload.decoded")))
-          .toEqual([]);
+        await waitFor(async () => {
+          const files = await readdir(path.join(rootDir, "runtime", "process-sessions"), { recursive: true });
+          return files.every((file) => !file.endsWith(".paperclip-upload.b64") && !file.endsWith(".paperclip-upload.decoded"));
+        });
       } finally {
         peer?.destroy();
         await bridge?.stop();
@@ -628,12 +629,16 @@ describe("stdin file race (parent PAP-4037)", () => {
 
   // ---- Host atomic-write tests ------------------------------------------
 
-  it("preserves the upload failure when best-effort cleanup also fails", async () => {
+  it.each(["fails", "stalls"])("preserves the upload failure when best-effort cleanup %s", async (cleanupMode) => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-upload-cleanup-"));
     cleanupDirs.push(rootDir);
     const local = createLocalSandboxRunner();
     const uploadFailure = new Error("Request failed with status code 502");
     let cleanupAttempted = false;
+    let rejectCleanup!: (error: Error) => void;
+    const stalledCleanup = new Promise<never>((_resolve, reject) => { rejectCleanup = reject; });
+    // Observe the test-owned promise even in the immediate-failure case.
+    void stalledCleanup.catch(() => {});
     const client = createCommandManagedSandboxCallbackBridgeQueueClient({
       remoteCwd: rootDir,
       runner: {
@@ -641,6 +646,7 @@ describe("stdin file race (parent PAP-4037)", () => {
           const script = input.args?.[1] ?? "";
           if (script.startsWith("rm -f")) {
             cleanupAttempted = true;
+            if (cleanupMode === "stalls") return stalledCleanup;
             throw new Error("Request failed with status code 403");
           }
           const result = await local.execute(input);
@@ -649,9 +655,15 @@ describe("stdin file race (parent PAP-4037)", () => {
         },
       },
     });
-    await expect(client.writeTextFile(path.join(rootDir, "message.json"), "test input"))
-      .rejects.toBe(uploadFailure);
-    expect(cleanupAttempted).toBe(true);
+    try {
+      await expect(Promise.race([
+        client.writeTextFile(path.join(rootDir, "message.json"), "test input"),
+        delay(1_000).then(() => { throw new Error("Upload waited for stalled cleanup"); }),
+      ])).rejects.toBe(uploadFailure);
+      expect(cleanupAttempted).toBe(true);
+    } finally {
+      rejectCleanup(new Error("Cleanup unavailable"));
+    }
   });
 
   // A runner that executes each bridge shell script on the local filesystem,

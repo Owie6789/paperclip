@@ -727,7 +727,9 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
         // or another attempt. A late finalize may fail or finish publishing;
         // either is safe for a sequence-aware caller. Preserve the original
         // failure even when the provider is still unavailable for cleanup.
-        await runChecked(
+        // Cleanup must not put another provider timeout on the retry/shutdown
+        // path. Its unique paths stay safe to remove after this call returns.
+        void runChecked(
           `clean failed upload ${remotePath}`,
           `rm -f ${shellQuote(tempPath)} ${shellQuote(decodedPath)}`,
         ).catch(() => undefined);
