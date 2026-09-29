@@ -4751,8 +4751,17 @@ export async function runChildProcess(
         if (execveViolations.length > 0) {
           // Release anything the spawn target already staged, such as the
           // temporary SSH identity file, before giving up. The spawn-error and
-          // close paths both do this, so this path must too.
-          await target.cleanup?.();
+          // close paths both do this, so this path must too. A cleanup failure
+          // must not replace the diagnostic, so it is reported and swallowed.
+          try {
+            await target.cleanup?.();
+          } catch (cleanupError) {
+            onLogError(
+              cleanupError,
+              runId,
+              "runChildProcess preflight cleanup failed after refusing an oversized launch",
+            );
+          }
           throw formatExecveLimitError(target.command, execveViolations, execveLimits);
         }
         const child = spawn(target.command, target.args, {
